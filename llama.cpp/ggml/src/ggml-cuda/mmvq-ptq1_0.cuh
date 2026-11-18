@@ -523,7 +523,6 @@ static void mul_mat_vec_ptq1_0_pt_launch(
         ggml_cuda_batch_invariant())
 
     if (has_fusion) {
-        GGML_ASSERT(ncols == 1 && "fusion only supported for ncols_dst=1");
         if (has_gate) {
             PTQ1_0_PT_LAUNCH(true, true);
         } else {
@@ -848,7 +847,7 @@ static bool mul_mat_vec_ptq1_0_ks_switch(
         const void * vx, const void * vy, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
         const int ncols_x, const int nrows_x, const int stride_row_x, cudaStream_t stream) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_HOPPER || cc >= GGML_CUDA_CC_BLACKWELL ||
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || (cc != GGML_CUDA_CC_VOLTA && (cc < GGML_CUDA_CC_HOPPER || cc >= GGML_CUDA_CC_BLACKWELL)) ||
         !ggml_cuda_ptq1_0_ks_enabled()) {
         return false;
     }

@@ -852,7 +852,7 @@ static void ggml_cuda_op_ssm_scan_impl(ggml_backend_cuda_context & ctx, ggml_ten
                       && K == 1
                       && n_t <= SSM_SSD_MAX_TOKENS
                       && GGML_CUDA_CC_IS_NVIDIA(cc)
-                      && cc >= GGML_CUDA_CC_TURING
+                      && cc >= GGML_CUDA_CC_VOLTA
                       && nr % 8 == 0;  // cuBLAS requires 8-element (16-byte) alignment
 
     if (use_ssd) {
