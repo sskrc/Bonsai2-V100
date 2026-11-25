@@ -336,6 +336,12 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
         if (cc >= GGML_CUDA_CC_HOPPER && cc < GGML_CUDA_CC_BLACKWELL) {
             return ne11 <= MMVQ_MAX_BATCH_SIZE;
         }
+        // Volta has no Turing-class int8 MMA, so the PTQ1_0 MMQ tile path falls back to a slow
+        // DP4A loop: V100, Bonsai 2.5 27B MTP n-max 4 (verify width 5) dropped to ~16 t/s.
+        // Keep the PT mat-vec up to MMVQ_MAX_BATCH_SIZE columns there.
+        if (cc < GGML_CUDA_CC_TURING) {
+            return ne11 <= MMVQ_MAX_BATCH_SIZE;
+        }
         return ne11 <= 4;
     }
 #endif

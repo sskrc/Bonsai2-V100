@@ -76,7 +76,7 @@ index 4775f4f6b..f1e118f83 100644
          return false;
      }
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 4121310f0..9e6c17acc 100644
+index 4121310f0..6fd377837 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -326,7 +326,7 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
@@ -88,7 +88,20 @@ index 4121310f0..9e6c17acc 100644
          // The PT mat-vec path shares the weight decode across columns; with the branch-free PTQ1_0
          // MMQ tile loader the tile path overtakes it at 5+ columns on Ada (RTX 4070, Bonsai 2 27B:
          // mat-vec 155 t/s vs MMQ 244 t/s at n=8).
-@@ -1979,7 +1979,7 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -336,6 +336,12 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
+         if (cc >= GGML_CUDA_CC_HOPPER && cc < GGML_CUDA_CC_BLACKWELL) {
+             return ne11 <= MMVQ_MAX_BATCH_SIZE;
+         }
++        // Volta has no Turing-class int8 MMA, so the PTQ1_0 MMQ tile path falls back to a slow
++        // DP4A loop: V100, Bonsai 2.5 27B MTP n-max 4 (verify width 5) dropped to ~16 t/s.
++        // Keep the PT mat-vec up to MMVQ_MAX_BATCH_SIZE columns there.
++        if (cc < GGML_CUDA_CC_TURING) {
++            return ne11 <= MMVQ_MAX_BATCH_SIZE;
++        }
+         return ne11 <= 4;
+     }
+ #endif
+@@ -1979,7 +1985,7 @@ void ggml_cuda_mul_mat_vec_q(
      if (fusion) {
          const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
          GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));

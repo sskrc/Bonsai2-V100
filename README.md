@@ -1,4 +1,13 @@
-# Ternary Bonsai 2 27B (V100 最速・ルーターモード構成)
+# Ternary Bonsai 2 / 2.5 27B (V100 最速・ルーターモード構成)
+
+| モデル ID | ファイル | 投機的デコーディング |
+|---|---|---|
+| `bonsai-2-27b` | `Ternary-Bonsai-2-27B-PTQ1_0.gguf` | DFlash2 (`-DFlash2-ft5-Q4_K_M.gguf`, n-max 3) |
+| `bonsai-2.5-27b` | `Ternary-Bonsai-2.5-27B-PTQ1_0-mtp.gguf` | MTP（モデル内蔵の draft head, `draft-mtp` n-max 3 / p-min 0.1） |
+
+- 2.5 はベースが Qwen3.8-27B ですが、HF クラスは `Qwen3_5ForConditionalGeneration` のため GGUF のアーキテクチャ名は 2 と同じ `qwen35` です。現在のビルド (`3f035ba66`) のままで読み込めます。
+- mmproj は 2 と 2.5 で同一ファイル（SHA256 一致）なので共用しています。
+- `--models-max 1` のため、リクエストの `model` に応じてルーターが自動で入れ替えます（同時ロードはしません）。
 
 Tesla V100-PCIE-16GB (`sm_70`, CUDA 12.4) 向けに `PrismML-Eng/llama.cpp` (`prism` ブランチ, `3f035ba66`) の Volta 制限を解除して専用ビルドし、Vision (`mmproj`)・DFlash2 投機的デコーディング・ルーターモード（動的ロード/アンロード）を有効化した構成です。
 
@@ -31,14 +40,28 @@ Tesla V100-PCIE-16GB (`sm_70`, CUDA 12.4) 向けに `PrismML-Eng/llama.cpp` (`pr
 | `PQ2_0` + `-fa on` + `f16` KV | 881.0 | 60.2 | — | V100では `PTQ1_0` より遅い |
 | `PTQ1_0` + `q8_0`/`q4_0` KVキャッシュ | 659.8〜725.3 | 47.5〜47.7 | — | V100では KV量子化すると約3割遅くなる |
 
+### Bonsai 2.5 実測 (V100, 生成 1024 tok × 3 プロンプト平均, reasoning_effort=low)
+
+| 構成 | 生成 tok/s | VRAM |
+|---|---:|---:|
+| Bonsai 2 + DFlash2（同条件での再測定） | 69.3 | 13.4 GB |
+| Bonsai 2.5 投機なし | 65.0 | 10.5 GB |
+| Bonsai 2.5 + Bonsai 2 用 DFlash2 | 78.2 | 13.5 GB |
+| **Bonsai 2.5 + MTP (n-max 3, p-min 0.1)** | **87.0** | **12.0 GB** |
+| Bonsai 2.5 + MTP (n-max 2) | 84.4 | 11.8 GB |
+
+- V100 では検証幅 5 以上 (n-max ≥ 4) で PTQ1_0 が MMQ（Volta に int8 MMA が無く DP4A ループ）に落ち、n-max 4 が 15 tok/s まで落ちていたため、`mmvq.cu` で Volta は 8 列まで PT mat-vec を使うよう修正（n-max 4: 15 → 76 tok/s）。それでも n-max 3 が最速。
+- 試して不採用: `p-min 0.3`(85.1)、`GGML_CUDA_TAIL_FUSION=1`(85.9)、`LLAMA_MTP_CHAIN=1`(このビルドでは assert で落ちる)。
+- fork 最新 `prism-b12178` + 本パッチも試したが、MTP n-max 3 で 86.0 tok/s（現ビルド 90.7）と V100 では遅く、`LLAMA_MTP_PREFILL_LEAN=1`(80.9)・`GGML_CUDA_ARN_PRE=1`(83.3) も逆効果のため現ビルド (`3f035ba66`) を維持。
+
 ## 使い方
 
 ```bash
 cd /home/riichi/AI/Bonsai2
 ./serve.sh start    # :8110 でルーター起動 (起動直後はモデル未ロード・VRAM 0)
 ./serve.sh status   # 稼働状態・ロード済みモデル数・VRAM 使用量を確認
-./serve.sh load     # 手動ロード (POST /models/load)
-./serve.sh unload   # アンロードして VRAM 解放 (POST /models/unload)
+./serve.sh load [model]    # 手動ロード (既定 bonsai-2-27b, 例: ./serve.sh load bonsai-2.5-27b)
+./serve.sh unload [model]  # アンロードして VRAM 解放
 ./serve.sh stop     # ルーターごと停止
 ./serve.sh key      # API キー (.api-key) を表示
 ```
