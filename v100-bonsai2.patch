@@ -54,11 +54,107 @@ index d2350d92e..e90fb2c65 100644
                  ggml_cuda_mm_fusion_args_host fusion_data{};
                  fusion_data.gate      = gate->src[0];
                  fusion_data.glu_op    = ggml_get_glu_op(glu);
+diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
+index 41533d321..ed0df00dd 100644
+--- a/ggml/src/ggml-cuda/mmvf.cu
++++ b/ggml/src/ggml-cuda/mmvf.cu
+@@ -819,6 +819,11 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
+                 if (cc >= GGML_CUDA_CC_TURING) {
+                     return ne11 <= 4;
+                 }
++                // Volta: the same thin-src0 rule. At an MTP verify width of 4 the 48-row ssm_alpha/ssm_beta
++                // projections otherwise go to cuBLAS sgemm + split-K reduce (~17 us per call on a V100).
++                if (src0_ne[1] <= 512 && ne11 <= MMVF_MAX_BATCH_SIZE) {
++                    return true;
++                }
+                 return ne11 <= 3;
+             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
+                 if (fp32_mma_hardware_available(cc)) {
 diff --git a/ggml/src/ggml-cuda/mmvq-ptq1_0.cuh b/ggml/src/ggml-cuda/mmvq-ptq1_0.cuh
-index 4775f4f6b..f1e118f83 100644
+index 4775f4f6b..c08094654 100644
 --- a/ggml/src/ggml-cuda/mmvq-ptq1_0.cuh
 +++ b/ggml/src/ggml-cuda/mmvq-ptq1_0.cuh
-@@ -523,7 +523,6 @@ static void mul_mat_vec_ptq1_0_pt_launch(
+@@ -65,19 +65,6 @@ static __device__ __forceinline__ int int4_at(const int4 & v, const int k) {
+     }
+ }
+ 
+-// one base-3 digit step on four bytes held as two 16-bit-lane words:
+-// returns the raw digits (0, 1, 2) as four unsigned bytes, advances the remainders.
+-// The digit bias is not applied here: the dot product uses the digits as-is with a mixed-sign
+-// dp4a and subtracts the exact integer activation sum of the 32-block once (see ptq1_0_pt_block_dot),
+-// which is the same integer as the biased sum, two ALU ops per 4 weights cheaper.
+-static __device__ __forceinline__ uint32_t ptq1_0_trit_step(uint32_t & vlo, uint32_t & vhi) {
+-    const uint32_t wlo = vlo * 3;
+-    const uint32_t whi = vhi * 3;
+-    vlo = wlo & 0x00FF00FF;
+-    vhi = whi & 0x00FF00FF;
+-    return __byte_perm(wlo, whi, 0x7531);
+-}
+-
+ // Dot products of nrows PTQ1_0 blocks with the same block index of ncols
+ // activation columns. bq[i] points at the weight block of row i, ycol[j] at
+ // the PT column base of column j, kbx is the block index along K.
+@@ -127,8 +114,13 @@ static __device__ __forceinline__ void ptq1_0_pt_block_dot(
+ 
+     // qs[0..15]: four groups of four bytes, five trits each: element 16*t + 4*g + b,
+     // plane t holds words 4*t .. 4*t+3
++    // digit t of each byte b is F_{t+1} - 3 F_t with F_t = floor(b 3^t / 256), the high bytes of the
++    // 16-bit-lane products: two IMUL, a PRMT and an IMAD per four weights instead of the
++    // multiply-and-mask walk's two IMUL, two LOP3 and a PRMT (same digits, see ptq1_0_ks_trits5)
++    constexpr uint32_t pt_pow3[5] = {3, 9, 27, 81, 243};
+     uint32_t vlo[nrows][4];
+     uint32_t vhi[nrows][4];
++    uint32_t fp[nrows][4];
+ #pragma unroll
+     for (int i = 0; i < nrows; ++i) {
+ #pragma unroll
+@@ -136,6 +128,7 @@ static __device__ __forceinline__ void ptq1_0_pt_block_dot(
+             const uint32_t packed = get_int_b4(bq[i]->qs, g);
+             vlo[i][g] = __byte_perm(packed, 0, 0x4140);
+             vhi[i][g] = __byte_perm(packed, 0, 0x4342);
++            fp[i][g]  = 0;
+         }
+     }
+ #pragma unroll
+@@ -149,7 +142,9 @@ static __device__ __forceinline__ void ptq1_0_pt_block_dot(
+         for (int i = 0; i < nrows; ++i) {
+ #pragma unroll
+             for (int g = 0; g < 4; ++g) {
+-                const uint32_t q = ptq1_0_trit_step(vlo[i][g], vhi[i][g]);
++                const uint32_t fn = __byte_perm(vlo[i][g] * pt_pow3[t], vhi[i][g] * pt_pow3[t], 0x7531);
++                const uint32_t q  = fn - 3*fp[i][g];
++                fp[i][g] = fn;
+ #pragma unroll
+                 for (int j = 0; j < ncols; ++j) {
+                     sumi[j][i] = ggml_cuda_dp4a_us(q, int4_at(u[j], g), sumi[j][i]);
+@@ -168,6 +163,7 @@ static __device__ __forceinline__ void ptq1_0_pt_block_dot(
+     // words 20..29 live in planes 5, 6 and the lower half of 7
+     uint32_t vlo2[nrows][2];
+     uint32_t vhi2[nrows][2];
++    uint32_t fp2[nrows][2];
+ #pragma unroll
+     for (int i = 0; i < nrows; ++i) {
+ #pragma unroll
+@@ -175,6 +171,7 @@ static __device__ __forceinline__ void ptq1_0_pt_block_dot(
+             const uint32_t packed = get_int_b4(bq[i]->qs + 16, g);
+             vlo2[i][g] = __byte_perm(packed, 0, 0x4140);
+             vhi2[i][g] = __byte_perm(packed, 0, 0x4342);
++            fp2[i][g]  = 0;
+         }
+     }
+     int4 u2[ncols];
+@@ -190,7 +187,9 @@ static __device__ __forceinline__ void ptq1_0_pt_block_dot(
+         for (int i = 0; i < nrows; ++i) {
+ #pragma unroll
+             for (int g = 0; g < 2; ++g) {
+-                const uint32_t q = ptq1_0_trit_step(vlo2[i][g], vhi2[i][g]);
++                const uint32_t fn = __byte_perm(vlo2[i][g] * pt_pow3[t], vhi2[i][g] * pt_pow3[t], 0x7531);
++                const uint32_t q  = fn - 3*fp2[i][g];
++                fp2[i][g] = fn;
+                 const int w = 20 + 2*t + g; // word index within the 128-element block
+ #pragma unroll
+                 for (int j = 0; j < ncols; ++j) {
+@@ -523,7 +522,6 @@ static void mul_mat_vec_ptq1_0_pt_launch(
          ggml_cuda_batch_invariant())
  
      if (has_fusion) {
@@ -66,7 +162,259 @@ index 4775f4f6b..f1e118f83 100644
          if (has_gate) {
              PTQ1_0_PT_LAUNCH(true, true);
          } else {
-@@ -848,7 +847,7 @@ static bool mul_mat_vec_ptq1_0_ks_switch(
+@@ -535,6 +533,228 @@ static void mul_mat_vec_ptq1_0_pt_launch(
+ #undef PTQ1_0_PT_LAUNCH
+ }
+ 
++// ---------------------------------------------------------------------------
++// Lane-group PTQ1_0 mat-vec for 2-4 columns on Volta (LW).
++//
++// The planar kernel above keeps one fp32 partial per (row, column, K block) in shared memory, which
++// caps a CTA at a few rows when K is long (ffn_down, K = 17408: 4 rows at 4 columns). Every CTA then
++// streams the whole activation set (ncols * K * 9/8 bytes, 78 KB at 4 x 17408) from L2 for 4 rows of
++// weights (15 KB): on a V100 that is ~100 MB of L2 traffic per ffn_down call at verify width 4 and
++// the kernel runs at the L2 limit (72 us, 3x the weight-streaming time).
++// Here LPR lanes own one group of ROWS rows and stride over K, accumulating in registers, then
++// reduce with shuffles. No shared memory is used, so L1 keeps the activations, and all warps of an SM
++// walk K in step, so they hit the same activation lines. The per-block arithmetic is
++// ptq1_0_pt_block_dot, on the same PT activation layout.
++// ---------------------------------------------------------------------------
++#define PTQ1_0_LW_THREADS 128
++
++template <int ncols, int ROWS, int LPR, bool has_fusion, bool has_gate>
++__launch_bounds__(PTQ1_0_LW_THREADS, (ncols*ROWS >= 12 ? 3 : 4))
++static __global__ void mul_mat_vec_ptq1_0_lw(
++        const void * vx_, const void * vy_, const ggml_cuda_mm_fusion_args_device fusion,
++        float * dst_,
++        const int ncols_x, const int nrows_x, const int stride_row_x, const int stride_col_y, const int stride_col_dst,
++        const int ngroups) {
++    const void * GGML_CUDA_RESTRICT vx = vx_;
++    const void * GGML_CUDA_RESTRICT vy = vy_;
++    float      * GGML_CUDA_RESTRICT dst = dst_;
++    ggml_cuda_pdl_sync();
++
++    const int bpr  = ncols_x / QK_PTQ1_0;
++    const int nblk = ptq1_0_pt_nblk(ncols_x);
++    const int lg   = threadIdx.x % LPR;
++    const int rg   = (blockIdx.x*PTQ1_0_LW_THREADS + threadIdx.x) / LPR;
++    const int rgc  = rg < ngroups ? rg : ngroups - 1; // past-the-end groups recompute the last one, not stored
++
++    const char * ycol[ncols];
++#pragma unroll
++    for (int j = 0; j < ncols; ++j) {
++        ycol[j] = (const char *) ((const block_q8_1 *) vy + j*stride_col_y);
++    }
++
++    const block_ptq1_0 * row_x[ROWS];
++    [[maybe_unused]] const block_ptq1_0 * row_g[ROWS];
++#pragma unroll
++    for (int i = 0; i < ROWS; ++i) {
++        int r = rgc*ROWS + i;
++        r = r < nrows_x ? r : nrows_x - 1;
++        row_x[i] = (const block_ptq1_0 *) vx + (int64_t) r*stride_row_x;
++        if constexpr (has_gate) {
++            row_g[i] = (const block_ptq1_0 *) fusion.gate + (int64_t) r*stride_row_x;
++        }
++    }
++
++    float acc[ncols][ROWS];
++    [[maybe_unused]] float accg[ncols][ROWS];
++#pragma unroll
++    for (int j = 0; j < ncols; ++j) {
++#pragma unroll
++        for (int i = 0; i < ROWS; ++i) {
++            acc[j][i] = 0.0f;
++            if constexpr (has_gate) {
++                accg[j][i] = 0.0f;
++            }
++        }
++    }
++
++    for (int kb = lg; kb < bpr; kb += LPR) {
++        const block_ptq1_0 * bq[ROWS];
++#pragma unroll
++        for (int i = 0; i < ROWS; ++i) {
++            bq[i] = row_x[i] + kb;
++        }
++        float dots[ncols][ROWS];
++        ptq1_0_pt_block_dot<ncols, ROWS>(bq, ycol, kb, nblk, dots);
++#pragma unroll
++        for (int j = 0; j < ncols; ++j) {
++#pragma unroll
++            for (int i = 0; i < ROWS; ++i) {
++                acc[j][i] += dots[j][i];
++            }
++        }
++        if constexpr (has_gate) {
++#pragma unroll
++            for (int i = 0; i < ROWS; ++i) {
++                bq[i] = row_g[i] + kb;
++            }
++            ptq1_0_pt_block_dot<ncols, ROWS>(bq, ycol, kb, nblk, dots);
++#pragma unroll
++            for (int j = 0; j < ncols; ++j) {
++#pragma unroll
++                for (int i = 0; i < ROWS; ++i) {
++                    accg[j][i] += dots[j][i];
++                }
++            }
++        }
++    }
++
++    // every lane leaves the K loop before the shuffles, so the full-warp mask is valid
++#pragma unroll
++    for (int off = LPR/2; off > 0; off >>= 1) {
++#pragma unroll
++        for (int j = 0; j < ncols; ++j) {
++#pragma unroll
++            for (int i = 0; i < ROWS; ++i) {
++                acc[j][i] += __shfl_xor_sync(0xffffffff, acc[j][i], off, WARP_SIZE);
++                if constexpr (has_gate) {
++                    accg[j][i] += __shfl_xor_sync(0xffffffff, accg[j][i], off, WARP_SIZE);
++                }
++            }
++        }
++    }
++
++    if (lg != 0 || rg >= ngroups) {
++        return;
++    }
++#pragma unroll
++    for (int i = 0; i < ROWS; ++i) {
++        const int row = rg*ROWS + i;
++        if (row >= nrows_x) {
++            break;
++        }
++#pragma unroll
++        for (int j = 0; j < ncols; ++j) {
++            float result = acc[j][i];
++            if constexpr (has_fusion) {
++                if (fusion.x_bias) {
++                    result += ((const float *) fusion.x_bias)[j*stride_col_dst + row];
++                }
++                if constexpr (has_gate) {
++                    float gate_value = accg[j][i];
++                    if (fusion.gate_bias) {
++                        gate_value += ((const float *) fusion.gate_bias)[j*stride_col_dst + row];
++                    }
++                    switch (fusion.glu_op) {
++                        case GGML_GLU_OP_SWIGLU:
++                            result *= ggml_cuda_op_silu_single(gate_value);
++                            break;
++                        case GGML_GLU_OP_GEGLU:
++                            result *= ggml_cuda_op_gelu_single(gate_value);
++                            break;
++                        case GGML_GLU_OP_SWIGLU_OAI:
++                            result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
++                            break;
++                        default:
++                            result = result * gate_value;
++                            break;
++                    }
++                }
++            }
++            dst[j*stride_col_dst + row] = result;
++        }
++    }
++}
++
++template <int ncols, int ROWS, int LPR>
++static void mul_mat_vec_ptq1_0_lw_launch(
++        const void * vx, const void * vy, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
++        const int ncols_x, const int nrows_x, const int stride_row_x, const int stride_col_y, const int stride_col_dst,
++        cudaStream_t stream) {
++    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
++    const bool has_gate   = fusion.gate != nullptr;
++    const int  ngroups    = (nrows_x + ROWS - 1) / ROWS;
++    const dim3 block_nums((ngroups*LPR + PTQ1_0_LW_THREADS - 1) / PTQ1_0_LW_THREADS, 1, 1);
++    const dim3 block_dims(PTQ1_0_LW_THREADS, 1, 1);
++    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
++#define PTQ1_0_LW_LAUNCH(FUS, GATE)                                                       \
++    ggml_cuda_kernel_launch(mul_mat_vec_ptq1_0_lw<ncols, ROWS, LPR, FUS, GATE>, lp,       \
++        vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, ngroups)
++    if (has_gate) {
++        PTQ1_0_LW_LAUNCH(true, true);
++    } else if (has_fusion) {
++        PTQ1_0_LW_LAUNCH(true, false);
++    } else {
++        PTQ1_0_LW_LAUNCH(false, false);
++    }
++#undef PTQ1_0_LW_LAUNCH
++}
++
++// GGML_CUDA_PTQ1_LW: unset = automatic choice on Volta, 0 = off (planar kernel), or one geometry for
++// experiments: 28 / 48 = ROWS 2 / 4 with LPR 8, 216 / 416 = ROWS 2 / 4 with LPR 16
++static int ggml_cuda_ptq1_0_lw_mode() {
++    static const int mode = [] {
++        const char * e = getenv("GGML_CUDA_PTQ1_LW");
++        return e ? atoi(e) : -1;
++    }();
++    return mode;
++}
++
++template <int ncols>
++static bool mul_mat_vec_ptq1_0_lw_dispatch(
++        const int rl, const void * vx, const void * vy, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
++        const int ncols_x, const int nrows_x, const int stride_row_x, const int stride_col_y, const int stride_col_dst,
++        cudaStream_t stream) {
++#define PTQ1_0_LW_CASE(R, L) \
++    case R*10 + L: mul_mat_vec_ptq1_0_lw_launch<ncols, R, L>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); return true;
++    switch (rl) {
++        PTQ1_0_LW_CASE(2, 8)
++        PTQ1_0_LW_CASE(4, 8)
++        default: break;
++    }
++    switch (rl) {
++        case 216: mul_mat_vec_ptq1_0_lw_launch<ncols, 2, 16>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); return true;
++        case 416: mul_mat_vec_ptq1_0_lw_launch<ncols, 4, 16>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); return true;
++        default: return false;
++    }
++#undef PTQ1_0_LW_CASE
++}
++
++// automatic choice, from V100 measurements at the Ternary Bonsai 27B shapes (us, planar -> LW):
++//   K = 17408 ffn_down   n=2: 53.8 -> 44.7   n=3: 55.1 -> 51.6   n=4: 72.5 -> 48-54   (ROWS 2, LPR 16)
++//   K = 6144  ssm_out    n=2: 19.1 -> 15.1   n=3: 24.1 -> 17.4   n=4: 27.1 -> 20.2   (ROWS 2, LPR 16)
++//   K = 5120, 10240 rows n=2: 27.3 -> 26.0   n=3: 31.2 -> 29.1   n=4: 34.4 -> 29.8   (ROWS 2, LPR 8)
++//   K = 5120, 17408 rows n=2: 38.4 -> 42.3   n=3: 45.3 -> 46.6   n=4: 50.7 -> 46.8   (planar wins below 4)
++// Returns the GGML_CUDA_PTQ1_LW code, or 0 to keep the planar kernel.
++static int ptq1_0_lw_auto(const int bpr, const int nrows_x, const int ncols_dst) {
++    if (bpr >= 48) {
++        return 216;
++    }
++    if (ncols_dst == 4 || nrows_x <= 10240) {
++        return 28;
++    }
++    return 0;
++}
++
+ // true when the dedicated kernel handles this call (plain 2D, K a multiple of 128, up to 8 columns)
+ static bool mul_mat_vec_ptq1_0_pt_switch(
+         const void * vx, const void * vy, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
+@@ -553,6 +773,22 @@ static bool mul_mat_vec_ptq1_0_pt_switch(
+     if (smem > ggml_cuda_info().devices[device].smpb) {
+         return false;
+     }
++    if (cc == GGML_CUDA_CC_VOLTA && ncols_dst >= 2 && ncols_dst <= 4) {
++        const int mode = ggml_cuda_ptq1_0_lw_mode();
++        if (mode != 0) {
++            const int rl = mode > 0 ? mode : ptq1_0_lw_auto(ncols_x / QK_PTQ1_0, nrows_x, ncols_dst);
++            bool done = false;
++            switch (ncols_dst) {
++                case 2: done = mul_mat_vec_ptq1_0_lw_dispatch<2>(rl, vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
++                case 3: done = mul_mat_vec_ptq1_0_lw_dispatch<3>(rl, vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
++                case 4: done = mul_mat_vec_ptq1_0_lw_dispatch<4>(rl, vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
++                default: break;
++            }
++            if (done) {
++                return true;
++            }
++        }
++    }
+     switch (ncols_dst) {
+         case 1:
+             if (rows_per_item == PTQ1_0_PT_ROWS_1) {
+@@ -848,7 +1084,7 @@ static bool mul_mat_vec_ptq1_0_ks_switch(
          const void * vx, const void * vy, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
          const int ncols_x, const int nrows_x, const int stride_row_x, cudaStream_t stream) {
      const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -74,6 +422,16 @@ index 4775f4f6b..f1e118f83 100644
 +    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || (cc != GGML_CUDA_CC_VOLTA && (cc < GGML_CUDA_CC_HOPPER || cc >= GGML_CUDA_CC_BLACKWELL)) ||
          !ggml_cuda_ptq1_0_ks_enabled()) {
          return false;
+     }
+@@ -866,7 +1102,8 @@ static bool mul_mat_vec_ptq1_0_ks_switch(
+         }
+         return true;
+     }
+-    if (bpr > 128 && bpr <= 160 && !has_gate) {
++    // V100: the planar kernel is faster on the K = 17408 down projection (38.4 vs 42.3 us), so Volta keeps it there
++    if (bpr > 128 && bpr <= 160 && !has_gate && cc != GGML_CUDA_CC_VOLTA) {
+         mul_mat_vec_ptq1_0_ks_launch<1, 8, 2, 160, 6, false>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, false, stream);
+         return true;
      }
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
 index 4121310f0..6fd377837 100644

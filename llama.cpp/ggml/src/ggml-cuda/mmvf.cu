@@ -819,6 +819,11 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
                 if (cc >= GGML_CUDA_CC_TURING) {
                     return ne11 <= 4;
                 }
+                // Volta: the same thin-src0 rule. At an MTP verify width of 4 the 48-row ssm_alpha/ssm_beta
+                // projections otherwise go to cuBLAS sgemm + split-K reduce (~17 us per call on a V100).
+                if (src0_ne[1] <= 512 && ne11 <= MMVF_MAX_BATCH_SIZE) {
+                    return true;
+                }
                 return ne11 <= 3;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
                 if (fp32_mma_hardware_available(cc)) {

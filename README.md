@@ -52,6 +52,15 @@ Tesla V100-PCIE-16GB (`sm_70`, CUDA 12.4) 向けに `PrismML-Eng/llama.cpp` (`pr
 
 - V100 では検証幅 5 以上 (n-max ≥ 4) で PTQ1_0 が MMQ（Volta に int8 MMA が無く DP4A ループ）に落ち、n-max 4 が 15 tok/s まで落ちていたため、`mmvq.cu` で Volta は 8 列まで PT mat-vec を使うよう修正（n-max 4: 15 → 76 tok/s）。それでも n-max 3 が最速。
 - 試して不採用: `p-min 0.3`(85.1)、`GGML_CUDA_TAIL_FUSION=1`(85.9)、`LLAMA_MTP_CHAIN=1`(このビルドでは assert で落ちる)。
+- **MTP 検証 (幅 2〜4) 向け V100 カーネル最適化**（`mmvq-ptq1_0.cuh` / `mmvf.cu`）:
+  - nsys で見るとデコード 1 ステップの 64% が PTQ1_0 の幅 4 行列ベクトル積。既存の planar (PT) カーネルは CTA ごとに活性化全体 (4 列 × K × 9/8 B、ffn_down で 78 KB) を L2 から読み直し、L2 帯域で頭打ちになっていた（ffn_down 72.5 µs、重み読み出しだけなら ~24 µs）。
+  - 新カーネル **LW**: LPR 本のレーンが ROWS 行を担当して K 方向にストライドし、レジスタで累積 → shuffle で縮約。共有メモリを使わないので L1 が活性化を保持する。幅 4: ffn_down 72.5→48 µs、ffn_up/gate 50.7→46.2、ssm_out 27.1→19.6、attn_qkv 34.4→29.1、attn_gate 24.8→22.3 µs。幅 2・3 も K が長い行列・中規模行列で採用（自動選択、`GGML_CUDA_PTQ1_LW=0` で無効化）。
+  - 3 進デコードを `F_{t+1} - 3F_t` 方式に変更（4 重みあたり 5→4 命令、同じ整数結果）。
+  - Volta では ffn_down (K=17408) の幅 1 を KS ではなく PT に（42.3→38.4 µs）。
+  - Volta の F32 細行列 (ssm_alpha/beta, 48×5120) を幅 4 でも mmvf に（cuBLAS sgemm + split-K を回避）。
+  - 結果（6 プロンプト×768 tok, greedy, MTP n-max 3）: 1 ステップ 28.2 → 24.7 ms（同クロック換算、-12.5%）、実測 88 → 94〜100 tok/s。ルーター経由で 105〜132 tok/s。
+  - 注意: この V100 は ~80°C で熱制限がかかり SM クロックが 1100〜1370 MHz で変動するため、tok/s は ±8% 程度ぶれる。冷却を改善すると更に伸びる。
+  - 試して不採用: multi-column gate/up+SwiGLU 融合（PT 外の遅い経路に落ちて 100→45 tok/s）、epilogue の並列化（効果なし）、n-max 4（幅 5 は PT のままで遅い）。
 - fork 最新 `prism-b12178` + 本パッチも試したが、MTP n-max 3 で 86.0 tok/s（現ビルド 90.7）と V100 では遅く、`LLAMA_MTP_PREFILL_LEAN=1`(80.9)・`GGML_CUDA_ARN_PRE=1`(83.3) も逆効果のため現ビルド (`3f035ba66`) を維持。
 
 ## 使い方
