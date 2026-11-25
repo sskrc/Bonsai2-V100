@@ -28,6 +28,7 @@ Tesla V100-PCIE-16GB (`sm_70`, CUDA 12.4) 向けに `PrismML-Eng/llama.cpp` (`pr
 - **画像入力 (Vision)**: `Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf` により OpenAI 互換の `image_url` 入力に対応
 - **モデル情報 (`GET /v1/models`)**: 各モデルに `meta.n_ctx`(1 スロットあたりの実効コンテキスト長)・`meta.n_ctx_train`・`architecture.input_modalities` が入ります。上流の router mode は読み込み中のモデルにしか `meta` を付けないため、未ロードのモデルでも preset の `ctx-size ÷ parallel` を同じキーで返すようにパッチしています(`tools/server/server-models.cpp`)。`context_length` は上流どおり `n_ctx_train` です。
 - **Thinking (`reasoning_effort`)**: `none`・`low`・`medium`・`xhigh`(既定)。テンプレートが受け付けない値(`high` など)は HTTP 500 になるため、`models.ini` の `reasoning-effort-allow = low,medium,xhigh` と `reasoning-effort-fallback = xhigh` で既定の `xhigh` に読み替えています。
+- **コンテキスト長**: `bonsai-2-27b` は 64K (65,536, f16 KV)。`bonsai-2.5-27b` は **160K (163,840, `cache-type-k/v = q8_0`)**。2.5 はハイブリッド構成で KV を持つのが 4 層に 1 層だけなので、q8_0 にすれば 160K まで載ります（ロード直後 15.0 GB、約 14 万トークンのプロンプトでピーク 15.4 GB / 16.4 GB。stable-audio の 0.3 GB を含む）。176K はロード直後で 15.6 GB と余裕が足りないため不採用、192K 以上はロードできません。q8_0 でも MTP の生成速度は落ちていません（1024 tok × 3 プロンプトで 88〜114 tok/s、平均 99）。ただし約 14 万トークンを読み込むと pp は約 270 tok/s まで下がり、8 分半かかります。`models.ini` はルーター起動時にしか読まれないため、変更後は `./serve.sh restart` が必要です。
 - **`cache-ram = 0`**: プロンプトの RAM キャッシュ(1 回あたり約 2〜7 GB の状態のコピー)を切り、応答開始までを約 1.19 秒から約 0.73 秒に短縮しています。代わりに、複数の会話を交互に使うと、切り替えのたびにプロンプトを読み直します(約 8k トークンで 10 秒前後)。
 
 ## 実測ベンチマーク結果 (Tesla V100 16GB)
